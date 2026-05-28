@@ -1,0 +1,125 @@
+# ============================================================================
+# RetLesionUni Default Configuration
+# All paths are relative to this config file's parent directory (project root).
+# ============================================================================
+
+# --- Data paths ----------------------------------------------------------
+data:
+  root: "data"
+  ddr_root: "data/DDR dataset"
+  odir_root: "data/ODIR"
+  label_mapping: "data/label_mapping.json"
+  preprocessed_cache: "outputs/preprocessed"
+
+  # DDR sub-directory names
+  ddr_detection_dir: "lesion_detection"
+  ddr_segmentation_dir: "lesion_segmentation"
+
+  # ODIR annotation file pattern: {split}_annotations.xlsx
+  odir_annotation_pattern: "{split}_annotations.xlsx"
+
+  splits: ["train", "valid", "test"]
+
+# --- Model ---------------------------------------------------------------
+model:
+  backbone: "vit_large_patch16_224"   # ViT-Large from timm
+  pretrained: false                 # Set to path of RetFound .pth or leave false for random init
+  pretrained_path: "pretrained/retfound.pth"
+  img_size: 512
+  patch_size: 16
+  hidden_dim: 1024
+  num_layers: 24
+  num_heads: 16
+  mlp_ratio: 4
+
+  # Multi-level feature extraction layers (1-indexed, 1-24)
+  multilevel_layers: [12, 18, 24]
+
+  # Position embedding interpolation
+  pos_embed_interp: "bilinear"      # bilinear / bicubic
+
+  # Task heads
+  odir_num_classes: 8
+  ddr_num_classes: 5                # bg + EX/HE/MA/SE
+
+  # LPM (Lesion Perception Module)
+  lpm:
+    enabled: true
+    lambda_lesion: 0.1
+
+  # CTAM (Cross-Task Alignment Module)
+  ctam:
+    enabled: true
+    proj_dim: 256
+    cross_attn_heads: 8
+    residual_alpha: 0.5
+    temperature: 0.07
+    lambda_align: 0.05
+
+# --- Losses --------------------------------------------------------------
+loss:
+  odir:
+    type: "asymmetric"
+    gamma_pos: 1.0
+    gamma_neg: 4.0
+  ddr:
+    type: "dice_ce"
+    dice_weight: 0.7
+    ce_weight: 0.3
+
+# --- Training ------------------------------------------------------------
+training:
+  # Stage 1: warmup with frozen backbone
+  stage1:
+    epochs: 30
+    lr: 0.001
+    freeze_ratio: 0.7
+    use_lpm: false
+    use_ctam: false
+
+  # Stage 2: full fine-tuning
+  stage2:
+    epochs: 70
+    lr: 0.0001
+    freeze_ratio: 0.0
+    use_lpm: true
+    use_ctam: true
+    warmup_epochs: 10              # Linear warmup for L_lesion and L_align
+
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+  scheduler: "cosine"
+
+  batch_size_odir: 8
+  batch_size_ddr: 8
+  num_workers: 4
+  pin_memory: true
+
+  # Weighted sampling for DR-positive ODIR samples
+  dr_positive_min_per_batch: 2
+  dr_positive_weight: 3.0
+
+  gradient_clip: 1.0
+  mixed_precision: "no"            # no / fp16 / bf16
+  gradient_checkpointing: false
+
+  # Checkpointing
+  checkpoint:
+    save_best: true
+    save_every_n_epochs: 10
+    monitor_metric: "ddr_mDice"
+    monitor_mode: "max"
+
+# --- Reproducibility -----------------------------------------------------
+seed: 42
+
+# --- Logging -------------------------------------------------------------
+logging:
+  tensorboard: true
+  log_dir: "outputs/logs"
+  print_interval: 10
+
+# --- Experiment ----------------------------------------------------------
+exp_name: "retlesionuni_full"
+output_dir: "outputs"

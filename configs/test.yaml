@@ -1,0 +1,102 @@
+# ============================================================================
+# RetLesionUni Test Configuration — small-scale for local verification.
+# Use: python scripts/train.py --config configs/test.yaml
+# ============================================================================
+
+data:
+  root: "data"
+  ddr_root: "data/DDR dataset"
+  odir_root: "data/ODIR"
+  label_mapping: "data/label_mapping.json"
+  preprocessed_cache: "outputs/preprocessed"
+
+  ddr_detection_dir: "lesion_detection"
+  ddr_segmentation_dir: "lesion_segmentation"
+  odir_annotation_pattern: "{split}_annotations.xlsx"
+  splits: ["train", "valid", "test"]
+
+model:
+  backbone: "vit_tiny_patch16_224"    # Tiny ViT for fast testing
+  pretrained: false
+  pretrained_path: ""
+  img_size: 128                      # Small resolution
+  patch_size: 16
+  hidden_dim: 192
+  num_layers: 12
+  num_heads: 3
+  mlp_ratio: 4
+  multilevel_layers: [6, 9, 12]
+  pos_embed_interp: "bilinear"
+  odir_num_classes: 8
+  ddr_num_classes: 5
+
+  lpm:
+    enabled: false                   # Disabled in stage1 for test
+    lambda_lesion: 0.1
+
+  ctam:
+    enabled: false
+    proj_dim: 64
+    cross_attn_heads: 4
+    residual_alpha: 0.5
+    temperature: 0.07
+    lambda_align: 0.05
+
+loss:
+  odir:
+    type: "asymmetric"
+    gamma_pos: 1.0
+    gamma_neg: 4.0
+  ddr:
+    type: "dice_ce"
+    dice_weight: 0.7
+    ce_weight: 0.3
+
+training:
+  stage1:
+    epochs: 1                        # Single epoch for test
+    lr: 0.001
+    freeze_ratio: 0.7
+    use_lpm: false
+    use_ctam: false
+
+  stage2:
+    epochs: 1
+    lr: 0.0001
+    freeze_ratio: 0.0
+    use_lpm: false                   # Keep off for quick test
+    use_ctam: false
+    warmup_epochs: 0
+
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+  scheduler: "cosine"
+
+  batch_size_odir: 2
+  batch_size_ddr: 2
+  num_workers: 0
+  pin_memory: false
+
+  dr_positive_min_per_batch: 1
+  dr_positive_weight: 3.0
+
+  gradient_clip: 1.0
+  mixed_precision: "no"
+  gradient_checkpointing: false
+
+  checkpoint:
+    save_best: false
+    save_every_n_epochs: 0
+    monitor_metric: "ddr_mDice"
+    monitor_mode: "max"
+
+seed: 42
+
+logging:
+  tensorboard: false
+  log_dir: "outputs/logs"
+  print_interval: 1
+
+exp_name: "test_run"
+output_dir: "outputs"
