@@ -1,1 +1,15 @@
 data/
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+pretrained/
+*.egg-info/
+.eggs/
+.pytest_cache/
