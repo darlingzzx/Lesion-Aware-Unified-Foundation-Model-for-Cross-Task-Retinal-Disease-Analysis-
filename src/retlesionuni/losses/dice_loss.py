@@ -18,6 +18,7 @@ class DiceCELoss(nn.Module):
         ce_weight: Weight for CE loss component (default 0.3).
         smooth: Smoothing factor for Dice (default 1.0).
         ignore_index: Class index to ignore in CE computation (default -1 = none).
+        class_weights: Optional list/tensor of per-class weights for CE loss.
     """
 
     def __init__(
@@ -26,12 +27,17 @@ class DiceCELoss(nn.Module):
         ce_weight: float = 0.3,
         smooth: float = 1.0,
         ignore_index: int = -1,
+        class_weights: list | None = None,
     ):
         super().__init__()
         self.dice_weight = dice_weight
         self.ce_weight = ce_weight
         self.smooth = smooth
         self.ignore_index = ignore_index
+        if class_weights is not None:
+            self.register_buffer('class_weights', torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute Dice+CE loss.
@@ -43,8 +49,18 @@ class DiceCELoss(nn.Module):
         Returns:
             Scalar loss tensor.
         """
-        # CE loss
-        loss_ce = F.cross_entropy(pred, target, ignore_index=self.ignore_index)
+        # Ensure target is Long (int64), cross_entropy requires Long
+        target = target.long()
+
+        # CE loss (with optional class weights for imbalanced data)
+        ce_weight = self.class_weights
+        if ce_weight is not None and ce_weight.device != pred.device:
+            ce_weight = ce_weight.to(pred.device)
+        loss_ce = F.cross_entropy(
+            pred, target,
+            weight=ce_weight,
+            ignore_index=self.ignore_index,
+        )
 
         # Per-class Dice loss
         num_classes = pred.shape[1]

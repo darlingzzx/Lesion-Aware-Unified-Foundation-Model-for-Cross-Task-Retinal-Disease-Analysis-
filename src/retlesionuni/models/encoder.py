@@ -40,6 +40,7 @@ class ViTEncoder(nn.Module):
         multilevel_layers: Optional[List[int]] = None,
         pretrained_path: Optional[str] = None,
         freeze_ratio: float = 0.0,
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.model_name = model_name
@@ -50,6 +51,7 @@ class ViTEncoder(nn.Module):
         self.num_heads = num_heads
         self.num_patches = (img_size // patch_size) ** 2
         self.multilevel_layers = multilevel_layers or [12, 18, 24]
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Use timm to create the ViT model
         import timm
@@ -61,16 +63,19 @@ class ViTEncoder(nn.Module):
             img_size=img_size,
         )
 
-        # Interpolate position embedding if the model's default size differs
+        # Load pretrained weights FIRST (before pos_embed interpolation)
+        # RetFound pos_embed is for 224x224 (197 tokens) and would overwrite
+        # the timm-interpolated pos_embed if loaded after interpolation.
+        if pretrained_path and pretrained_path not in ("true", "false", ""):
+            self._load_retfound_weights(pretrained_path)
+
+        # Interpolate position embedding AFTER loading RetFound weights
+        # RetFound has pos_embed for 14x14 grid; we need to expand to target grid
         if hasattr(self.vit, "pos_embed"):
             default_grid = int((self.vit.pos_embed.shape[1] - 1) ** 0.5)
             actual_grid = img_size // patch_size
             if default_grid != actual_grid:
                 self._interpolate_pos_embed(default_grid, actual_grid)
-
-        # Load pretrained weights if provided
-        if pretrained_path and pretrained_path not in ("true", "false", ""):
-            self._load_retfound_weights(pretrained_path)
 
         # Apply freezing
         if freeze_ratio > 0:
@@ -117,9 +122,14 @@ class ViTEncoder(nn.Module):
         else:
             state_dict = checkpoint
 
-        # Remove classification head keys (we use our own heads)
-        head_keys = ["head.weight", "head.bias", "fc_norm.weight", "fc_norm.bias"]
-        for k in head_keys:
+        # Remove keys that will mismatch due to different image resolution:
+        # - Classification head keys (we use our own heads)
+        # - pos_embed (RetFound is for 224x224, timm model is for target img_size)
+        keys_to_remove = [
+            "head.weight", "head.bias", "fc_norm.weight", "fc_norm.bias",
+            "pos_embed",  # RetFound: (1, 197, 1024) vs target: (1, 1025, 1024)
+        ]
+        for k in keys_to_remove:
             if k in state_dict:
                 del state_dict[k]
 
@@ -130,11 +140,11 @@ class ViTEncoder(nn.Module):
         important_missing = [k for k in missing
                             if not any(hk in k for hk in ["head.", "fc_norm."])]
         if important_missing:
-            print(f"[Encoder] Missing keys ({len(important_missing)}), first 5: {important_missing[:5]}")
+            print(f"[Encoder] Missing keys ({len(important_missing)}), first 5: {important_missing[:5]}", flush=True)
         if unexpected:
-            print(f"[Encoder] Unexpected keys ({len(unexpected)}), first 5: {unexpected[:5]}")
+            print(f"[Encoder] Unexpected keys ({len(unexpected)}), first 5: {unexpected[:5]}", flush=True)
 
-        print(f"[Encoder] Loaded RetFound weights from {pretrained_path}")
+        print(f"[Encoder] Loaded RetFound weights from {pretrained_path}", flush=True)
 
     def freeze_layers(self, freeze_ratio: float):
         """Freeze the first `freeze_ratio` fraction of transformer blocks."""
@@ -143,7 +153,7 @@ class ViTEncoder(nn.Module):
         for i in range(num_freeze):
             for param in blocks[i].parameters():
                 param.requires_grad = False
-        print(f"[Encoder] Frozen {num_freeze}/{len(blocks)} layers ({freeze_ratio:.0%})")
+        print(f"[Encoder] Frozen {num_freeze}/{len(blocks)} layers ({freeze_ratio:.0%})", flush=True)
 
     def unfreeze_all(self):
         """Unfreeze all parameters."""
@@ -191,10 +201,13 @@ class ViTEncoder(nn.Module):
 
         for i, block in enumerate(self.vit.blocks, start=1):
             if return_attention and i == len(self.vit.blocks):
-                # For last layer, we need attention maps
+                # For last layer, we need attention maps (no checkpointing)
                 attn_out, attn_weights = self._block_forward_with_attention(block, x)
                 x = attn_out
                 last_attention = attn_weights
+            elif self.use_gradient_checkpointing and self.training:
+                # Use gradient checkpointing to save memory during training
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)
 

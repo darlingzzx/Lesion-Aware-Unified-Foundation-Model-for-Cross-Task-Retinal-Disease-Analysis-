@@ -63,15 +63,17 @@ def test_heads_forward(model, cfg):
     img_size = cfg.model.img_size
     num_patches = (img_size // cfg.model.patch_size) ** 2
 
-    cls_token = torch.randn(4, hidden_dim)
-    odir_out = model.odir_head(cls_token)
+    # ODIR input is cls_token + patch_pooled = hidden_dim * 2
+    fused_features = torch.randn(4, hidden_dim * 2)
+    odir_out = model.odir_head(fused_features)
     assert odir_out.shape == (4, odir_classes)
     assert (odir_out >= 0).all() and (odir_out <= 1).all()
     print("  ODIR head: {} in [0,1]".format(odir_out.shape))
 
     patch_tokens = [torch.randn(2, num_patches, hidden_dim) for _ in range(3)]
     ddr_out = model.ddr_head(patch_tokens, img_size)
-    assert ddr_out.shape == (2, ddr_classes, img_size, img_size)
+    assert ddr_out.shape == (2, ddr_classes, img_size, img_size), \
+        f"DDR shape {ddr_out.shape} != (2, {ddr_classes}, {img_size}, {img_size})"
     print("  DDR head: {}".format(ddr_out.shape))
 
     print("PASS: heads forward")
@@ -83,8 +85,9 @@ def test_lpm_forward():
     lpm = LesionPerceptionModule()
     B, N, D, H = 2, 196, 768, 12
     patches = torch.randn(B, N, D)
-    attn1 = torch.randn(B, H, N + 1, N + 1)
-    attn2 = attn1 + 0.01 * torch.randn(B, H, N + 1, N + 1)
+    # ViT attention is always post-softmax (positive, row-sum=1)
+    attn1 = torch.softmax(torch.randn(B, H, N + 1, N + 1), dim=-1)
+    attn2 = torch.softmax(torch.randn(B, H, N + 1, N + 1), dim=-1)
 
     enhanced, loss = lpm(patches, attn1, attn2)
     assert enhanced.shape == (B, N, D)

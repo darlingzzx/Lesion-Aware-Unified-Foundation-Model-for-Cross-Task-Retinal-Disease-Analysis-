@@ -23,8 +23,8 @@ data:
 # --- Model ---------------------------------------------------------------
 model:
   backbone: "vit_large_patch16_224"   # ViT-Large from timm
-  pretrained: false                 # Set to path of RetFound .pth or leave false for random init
-  pretrained_path: "pretrained/retfound.pth"
+  pretrained: true                                # Load RetFound pretrained weights
+  pretrained_path: "pretrained/RETFound_cfp_weights.pth"
   img_size: 512
   patch_size: 16
   hidden_dim: 1024
@@ -45,7 +45,7 @@ model:
   # LPM (Lesion Perception Module)
   lpm:
     enabled: true
-    lambda_lesion: 0.1
+    lambda_lesion: 100.0  # KL loss scale; raw KL≈5e-4 @T=0.1, target L_les≈0.005~0.05
 
   # CTAM (Cross-Task Alignment Module)
   ctam:
@@ -66,12 +66,14 @@ loss:
     type: "dice_ce"
     dice_weight: 0.7
     ce_weight: 0.3
+    # Inverse-frequency weights: BG=99.4%, EX=0.19%, HE=0.35%, MA=0.02%, SE=0.07%
+    class_weights: [0.1, 5.0, 5.0, 10.0, 5.0]
 
 # --- Training ------------------------------------------------------------
 training:
   # Stage 1: warmup with frozen backbone
   stage1:
-    epochs: 30
+    epochs: 5
     lr: 0.001
     freeze_ratio: 0.7
     use_lpm: false
@@ -79,37 +81,40 @@ training:
 
   # Stage 2: full fine-tuning
   stage2:
-    epochs: 70
+    epochs: 10
     lr: 0.0001
     freeze_ratio: 0.0
     use_lpm: true
     use_ctam: true
-    warmup_epochs: 10              # Linear warmup for L_lesion and L_align
+    warmup_epochs: 3               # Linear warmup for L_lesion and L_align
 
   optimizer: "adamw"
   betas: [0.9, 0.999]
   weight_decay: 0.0001
   scheduler: "cosine"
 
-  batch_size_odir: 8
-  batch_size_ddr: 8
-  num_workers: 4
+  batch_size_odir: 4
+  batch_size_ddr: 4
+  num_workers: 0   # Set to 0 on Windows to avoid DataLoader multiprocessing deadlocks
   pin_memory: true
 
   # Weighted sampling for DR-positive ODIR samples
-  dr_positive_min_per_batch: 2
+  dr_positive_min_per_batch: 1
   dr_positive_weight: 3.0
 
   gradient_clip: 1.0
-  mixed_precision: "no"            # no / fp16 / bf16
-  gradient_checkpointing: false
+  gradient_accumulation_steps: 2   # Simulate larger batch without OOM (effective batch=4×2=8)
+  mixed_precision: "bf16"          # no / fp16 / bf16  (bf16 avoids fp16 overflow in DDR decoder)
+  gradient_checkpointing: true     # Trade compute for memory (saves ~30-50% VRAM)
+  val_freq: 5                      # Validate every N epochs (saves ~20% time)
 
   # Checkpointing
   checkpoint:
     save_best: true
-    save_every_n_epochs: 10
+    save_every_n_epochs: 2
     monitor_metric: "ddr_mDice"
     monitor_mode: "max"
+    resume: true   # Auto-resume from last checkpoint on restart
 
 # --- Reproducibility -----------------------------------------------------
 seed: 42

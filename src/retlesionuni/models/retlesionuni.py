@@ -17,6 +17,11 @@ class RetLesionUni(nn.Module):
     Architecture:
         Shared ViT Encoder -> [LPM, CTAM, ODIR Head, DDR Head]
 
+    Feature flow (fixed):
+        cls_token(1024) + patch_pooled(1024) = 2048-dim base feature
+        if CTAM: z_odir_enhanced(256) --proj--> 2048, ADD to base → 2048
+        odir_head(2048) → 8-class prediction
+
     Args:
         config: Model configuration namespace.
     """
@@ -28,6 +33,7 @@ class RetLesionUni(nn.Module):
 
         # Shared encoder
         model_name = getattr(cfg, "backbone", "vit_large_patch16_224")
+        use_ckpt = getattr(config.training, "gradient_checkpointing", False)
         self.encoder = ViTEncoder(
             model_name=model_name,
             img_size=cfg.img_size,
@@ -39,6 +45,7 @@ class RetLesionUni(nn.Module):
             multilevel_layers=cfg.multilevel_layers,
             pretrained_path=cfg.pretrained_path if cfg.pretrained else None,
             freeze_ratio=0.0,
+            use_gradient_checkpointing=use_ckpt,
         )
 
         # LPM
@@ -54,13 +61,22 @@ class RetLesionUni(nn.Module):
                 alpha=cfg.ctam.residual_alpha,
                 temperature=cfg.ctam.temperature,
             )
+            # Project CTAM output (256) back to feature dim for additive fusion
+            self.ctam_fusion = nn.Linear(cfg.ctam.proj_dim, cfg.hidden_dim * 2)
+            # Learnable gate: small init (0.1) prevents CTAM from dominating,
+            # and its absence during validation causes less distribution shift
+            self.ctam_fusion_scale = nn.Parameter(torch.tensor(0.1))
         else:
             self.ctam = None
+            self.ctam_fusion = None
         self.lambda_align = cfg.ctam.lambda_align
 
         # Task heads
+        # ODIR input: cls_token(1024) + patch_pooled(1024) = 2048
+        # CTAM features are fused additively (no dimension change)
+        odir_dim_in = cfg.hidden_dim * 2  # 2048
         self.odir_head = ODIRClassifier(
-            dim_in=cfg.hidden_dim,
+            dim_in=odir_dim_in,
             num_classes=cfg.odir_num_classes,
         )
         self.ddr_head = DDRSegmentator(
@@ -113,10 +129,14 @@ class RetLesionUni(nn.Module):
                 enc1["last_attention"],
                 enc2["last_attention"],
             )
+            # Fix 1: Pool LPM-enhanced patch tokens for classification
+            f_odir_pooled = f_odir_enhanced.mean(dim=1)  # (B, 1024)
         else:
-            f_odir_enhanced = enc1["patch_tokens"]
+            # Fix 7: Pool raw patch tokens when LPM is off
+            f_odir_pooled = enc1["patch_tokens"].mean(dim=1)  # (B, 1024)
 
-        odir_logits = self.odir_head(enc1["cls_token"])
+        # Fix 7: Fuse CLS token (global semantics) with patch-pooled (local details)
+        f_odir_for_cls = torch.cat([enc1["cls_token"], f_odir_pooled], dim=-1)  # (B, 2048)
 
         # --- DDR path ---
         enc_ddr = self.encoder(x_ddr, return_multilevel=True)
@@ -126,11 +146,17 @@ class RetLesionUni(nn.Module):
         loss_align = torch.tensor(0.0, device=x_odir_v1.device)
         if self.use_ctam:
             dr_labels = odir["dr_label"].to(x_odir_v1.device)
-            _, _, loss_align = self.ctam(
+            z_odir_enhanced, z_ddr_aligned, loss_align = self.ctam(
                 enc1["cls_token"],
                 enc_ddr["cls_token"],
                 dr_labels,
             )
+            # Fix 2: Additive fusion of CTAM features (256→2048 projection, then add)
+            # warmup_factor gates both loss_align and ctam_fused to prevent early noise
+            ctam_fused = self.ctam_fusion(z_odir_enhanced)  # (B, 256) → (B, 2048)
+            f_odir_for_cls = f_odir_for_cls + self.ctam_fusion_scale * self.warmup_factor * ctam_fused
+
+        odir_logits = self.odir_head(f_odir_for_cls)
 
         return {
             "odir_logits": odir_logits,

@@ -17,7 +17,7 @@ from ..losses.asl_loss import AsymmetricLoss
 from ..losses.dice_loss import DiceCELoss
 from ..models.retlesionuni import RetLesionUni
 from ..utils.logger import Logger
-from .checkpoint import save_checkpoint
+from .checkpoint import load_checkpoint, save_checkpoint
 from .scheduler import build_scheduler
 
 
@@ -33,14 +33,14 @@ class Trainer:
         self.cfg_train = config.training
         self.cfg_model = config.model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Device: {self.device}")
+        print(f"Device: {self.device}", flush=True)
 
         # Create data loaders
         self._setup_data()
 
         # Create model
         self.model = RetLesionUni(config).to(self.device)
-        print(f"Model params: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Model params: {sum(p.numel() for p in self.model.parameters()):,}", flush=True)
 
         # Create losses
         self.loss_odir = AsymmetricLoss(
@@ -50,6 +50,7 @@ class Trainer:
         self.loss_ddr = DiceCELoss(
             dice_weight=config.loss.ddr.dice_weight,
             ce_weight=config.loss.ddr.ce_weight,
+            class_weights=getattr(config.loss.ddr, 'class_weights', None),
         )
 
         # Logger
@@ -57,6 +58,16 @@ class Trainer:
             log_dir=config.logging.log_dir,
             enabled=config.logging.tensorboard,
         )
+
+        # Mixed precision
+        self.use_amp = self.cfg_train.mixed_precision in ("fp16", "bf16")
+        self.amp_dtype = torch.bfloat16 if self.cfg_train.mixed_precision == "bf16" else torch.float16
+        self.scaler = torch.amp.GradScaler("cuda", enabled=(self.cfg_train.mixed_precision == "fp16"))
+        if self.use_amp:
+            print(f"Mixed precision: {self.cfg_train.mixed_precision}")
+
+        # Validation frequency (validate every N epochs to save time)
+        self.val_freq = getattr(self.cfg_train, 'val_freq', 5)
 
         # Checkpoint dir
         self.ckpt_dir = Path(config.output_dir) / "checkpoints" / config.exp_name
@@ -85,37 +96,76 @@ class Trainer:
         )
 
     def train(self):
-        """Run full two-stage training."""
+        """Run full two-stage training with resume support."""
         total_epochs = self.cfg_train.stage1.epochs + self.cfg_train.stage2.epochs
-        print(f"\n{'='*60}")
-        print(f"Training: {self.cfg_train.stage1.epochs} (stage1) + {self.cfg_train.stage2.epochs} (stage2) = {total_epochs} epochs")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"Training: {self.cfg_train.stage1.epochs} (stage1) + {self.cfg_train.stage2.epochs} (stage2) = {total_epochs} epochs", flush=True)
+        print(f"{'='*60}", flush=True)
 
-        # --- Stage 1 ---
-        print("\n>>> Stage 1: Freeze backbone, train heads only")
-        self._run_stage("stage1")
+        # --- Check for resume ---
+        resume_path = self.ckpt_dir / "resume_checkpoint.pth"
+        enable_resume = getattr(self.cfg_train.checkpoint, 'resume', True)
 
-        # --- Stage 2 ---
-        print("\n>>> Stage 2: Unfreeze all, full loss with LPM + CTAM")
-        self._run_stage("stage2")
+        if enable_resume and resume_path.exists():
+            print(f"\n>>> Resume checkpoint found: {resume_path}", flush=True)
+            # Peek at stage/epoch without loading into model yet
+            resume_ckpt = torch.load(str(resume_path), map_location=self.device, weights_only=False)
+            resumed_stage = resume_ckpt.get("stage_name", "stage1")
+            resumed_epoch = resume_ckpt.get("epoch", 0)
+            print(f">>> Resuming from: {resumed_stage} epoch {resumed_epoch}", flush=True)
+
+            if resumed_stage == "stage2":
+                print(">>> Stage 1 already completed, skipping...", flush=True)
+                print("\n>>> Stage 2: Unfreeze all, full loss with LPM + CTAM (resuming)", flush=True)
+                self._run_stage("stage2", start_epoch=resumed_epoch + 1, resume_path=resume_path)
+            elif resumed_stage == "stage1":
+                if resumed_epoch >= self.cfg_train.stage1.epochs:
+                    print(">>> Stage 1 completed, moving to Stage 2...", flush=True)
+                    print("\n>>> Stage 2: Unfreeze all, full loss with LPM + CTAM", flush=True)
+                    self._run_stage("stage2")
+                else:
+                    print("\n>>> Stage 1: Freeze backbone, train heads only (resuming)", flush=True)
+                    self._run_stage("stage1", start_epoch=resumed_epoch + 1, resume_path=resume_path)
+                    if resumed_epoch + 1 <= self.cfg_train.stage1.epochs:
+                        print("\n>>> Stage 2: Unfreeze all, full loss with LPM + CTAM", flush=True)
+                        self._run_stage("stage2")
+        else:
+            # --- Stage 1 (fresh start) ---
+            print("\n>>> Stage 1: Freeze backbone, train heads only", flush=True)
+            self._run_stage("stage1")
+
+            # --- Stage 2 ---
+            print("\n>>> Stage 2: Unfreeze all, full loss with LPM + CTAM", flush=True)
+            self._run_stage("stage2")
 
         # Save final model
         save_checkpoint(
-            self.model, self.optimizer,
+            self.model, self.optimizer, self.scheduler,
             epoch=total_epochs,
             best_metric=self.best_metric,
             config=self.config,
             output_dir=self.ckpt_dir,
+            stage_name="done",
             filename="final_model.pth",
             is_best=False,
         )
         self.logger.close()
         print("\nTraining complete!")
 
-    def _run_stage(self, stage_name: str):
+    def _run_stage(self, stage_name: str, start_epoch: int = 1, resume_path: str | None = None):
         stage_cfg = getattr(self.cfg_train, stage_name)
         epochs = stage_cfg.epochs
-        self.best_metric = 0.0 if self.cfg_train.checkpoint.monitor_mode == "max" else float("inf")
+
+        if start_epoch > epochs:
+            print(f"  Stage {stage_name} already complete (epoch {start_epoch} > {epochs}), skipping.", flush=True)
+            return
+
+        resume_ckpt = None
+        if resume_path is not None:
+            resume_ckpt = torch.load(str(resume_path), map_location=self.device, weights_only=False)
+            self.best_metric = resume_ckpt.get("best_metric", 0.0)
+        else:
+            self.best_metric = 0.0 if self.cfg_train.checkpoint.monitor_mode == "max" else float("inf")
 
         # Configure model for stage
         self.model.set_stage_config(
@@ -142,7 +192,16 @@ class Trainer:
         # Scheduler
         self.scheduler = build_scheduler(self.optimizer, self.cfg_train, t_max=epochs)
 
-        for epoch in range(1, epochs + 1):
+        # Resume: restore model/optimizer/scheduler state
+        if resume_ckpt is not None:
+            self.model.load_state_dict(resume_ckpt["model_state_dict"])
+            if resume_ckpt.get("optimizer_state_dict"):
+                self.optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            if resume_ckpt.get("scheduler_state_dict"):
+                self.scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+            print(f"  Loaded model, optimizer, and scheduler state from checkpoint.", flush=True)
+
+        for epoch in range(start_epoch, epochs + 1):
             # Update warmup factor for stage 2
             if stage_name == "stage2" and stage_cfg.use_ctam:
                 warmup = min(1.0, epoch / max(1, stage_cfg.warmup_epochs))
@@ -155,85 +214,132 @@ class Trainer:
             train_loss = self._train_epoch(epoch, epochs, stage_name)
             self.scheduler.step()
 
-            # Validation
-            odir_metrics = self._validate_odir()
-            ddr_metrics = self._validate_ddr()
+            # Validation (every N epochs, always on epoch 1 and final epoch)
+            do_val = (epoch == 1 or epoch == epochs or epoch % self.val_freq == 0)
+            if do_val:
+                odir_metrics = self._validate_odir()
+                ddr_metrics = self._validate_ddr()
+            else:
+                odir_metrics = {"f1": 0.0, "accuracy": 0.0, "auc": 0.0}
+                ddr_metrics = {"mDice": 0.0, "mIoU": 0.0}
 
             # Logging
             lr = self.optimizer.param_groups[0]["lr"]
+            odir_f1 = odir_metrics.get('f1', 0)
+            ddr_dice = ddr_metrics.get('mDice', 0)
+            ddr_lesion = ddr_metrics.get('lesion_mDice', 0)
             print(
                 f"Epoch {epoch}/{epochs} | "
                 f"LR={lr:.2e} | "
                 f"Train Loss={train_loss:.4f} | "
-                f"ODIR F1={odir_metrics.get('f1', 0):.4f} | "
-                f"DDR mDice={ddr_metrics.get('mDice', 0):.4f}"
+                f"ODIR F1={odir_f1:.4f} | "
+                f"DDR mDice={ddr_dice:.4f} (lesion={ddr_lesion:.4f})"
+                f"{' (skipped val)' if not do_val else ''}",
+                flush=True,
             )
+            # Per-class ODIR F1 breakdown on validation epochs
+            if do_val and 'per_class_f1' in odir_metrics:
+                names = ['N', 'D', 'G', 'C', 'A', 'H', 'M', 'O']
+                pcf1 = odir_metrics['per_class_f1']
+                pcf1_str = ' | '.join(f'{n}={v:.3f}' for n, v in zip(names, pcf1))
+                print(f"  Per-class F1: {pcf1_str}", flush=True)
 
             if self.logger.enabled:
-                self.logger.log_scalar("train/loss", train_loss, epoch)
-                self.logger.log_scalar("train/lr", lr, epoch)
+                base_epoch = epoch
+                if stage_name == "stage2":
+                    base_epoch += self.cfg_train.stage1.epochs
+                self.logger.log_scalar("train/loss", train_loss, base_epoch)
+                self.logger.log_scalar("train/lr", lr, base_epoch)
                 for k, v in {**odir_metrics, **ddr_metrics}.items():
-                    self.logger.log_scalar(f"val/{k}", v, epoch)
+                    if isinstance(v, (int, float)):
+                        self.logger.log_scalar(f"val/{k}", v, base_epoch)
+                    elif isinstance(v, list):
+                        for i, cls_v in enumerate(v):
+                            self.logger.log_scalar(f"val/{k}_{i}", cls_v, base_epoch)
 
-            # Checkpointing
-            monitor_val = ddr_metrics.get(
-                self.cfg_train.checkpoint.monitor_metric.replace("ddr_", ""), 0
-            )
-            is_best = (
-                (self.cfg_train.checkpoint.monitor_mode == "max" and monitor_val > self.best_metric)
-                or (self.cfg_train.checkpoint.monitor_mode == "min" and monitor_val < self.best_metric)
-            )
-            if is_best:
-                self.best_metric = monitor_val
+            # Update best metric and save periodic checkpoint
+            if do_val:
+                monitor_val = ddr_metrics.get(
+                    self.cfg_train.checkpoint.monitor_metric.replace("ddr_", ""), 0
+                )
+                is_best = (
+                    (self.cfg_train.checkpoint.monitor_mode == "max" and monitor_val > self.best_metric)
+                    or (self.cfg_train.checkpoint.monitor_mode == "min" and monitor_val < self.best_metric)
+                )
+                if is_best:
+                    self.best_metric = monitor_val
+            else:
+                is_best = False
 
             if (self.cfg_train.checkpoint.save_every_n_epochs > 0
                     and epoch % self.cfg_train.checkpoint.save_every_n_epochs == 0):
                 save_checkpoint(
-                    self.model, self.optimizer,
+                    self.model, self.optimizer, self.scheduler,
                     epoch=epoch, best_metric=self.best_metric,
                     config=self.config, output_dir=self.ckpt_dir,
+                    stage_name=stage_name,
                     filename=f"{stage_name}_epoch_{epoch}.pth",
                     is_best=is_best,
                 )
+
+            # Always save resume checkpoint (for crash recovery)
+            save_checkpoint(
+                self.model, self.optimizer, self.scheduler,
+                epoch=epoch, best_metric=self.best_metric,
+                config=self.config, output_dir=self.ckpt_dir,
+                stage_name=stage_name,
+                filename="resume_checkpoint.pth",
+                is_best=False,
+            )
 
     def _train_epoch(self, epoch: int, total_epochs: int, stage_name: str) -> float:
         self.model.train()
         total_loss = 0.0
         num_batches = len(self.joint_train_loader)
+        accum_steps = getattr(self.cfg_train, 'gradient_accumulation_steps', 1)
 
+        self.optimizer.zero_grad()
         for batch_idx, batch in enumerate(self.joint_train_loader):
             batch = self._to_device(batch)
 
-            self.optimizer.zero_grad()
+            with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                outputs = self.model(batch)
 
-            outputs = self.model(batch)
-
-            loss_odir = self.loss_odir(
-                outputs["odir_logits"],
-                batch["odir"]["labels"],
-            )
-            loss_ddr = self.loss_ddr(
-                outputs["ddr_seg"],
-                batch["ddr"]["mask"],
-            )
-
-            loss = loss_odir + loss_ddr + outputs["loss_lesion"] + outputs["loss_align"]
-            loss.backward()
-
-            if self.cfg_train.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.cfg_train.gradient_clip
+                loss_odir = self.loss_odir(
+                    outputs["odir_logits"],
+                    batch["odir"]["labels"],
+                )
+                loss_ddr = self.loss_ddr(
+                    outputs["ddr_seg"],
+                    batch["ddr"]["mask"],
                 )
 
-            self.optimizer.step()
-            total_loss += loss.item()
+                loss = (loss_odir + loss_ddr + outputs["loss_lesion"] + outputs["loss_align"])
+                loss = loss / accum_steps  # Normalize for gradient accumulation
+
+            self.scaler.scale(loss).backward()
+            total_loss += loss.item() * accum_steps  # Un-normalize for logging
+
+            # Step only after accumulation
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == num_batches:
+                self.scaler.unscale_(self.optimizer)
+
+                if self.cfg_train.gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg_train.gradient_clip
+                    )
+
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
 
             if batch_idx % self.config.logging.print_interval == 0:
                 print(
                     f"  Batch {batch_idx}/{num_batches} | "
                     f"L_O={loss_odir.item():.4f} L_D={loss_ddr.item():.4f} "
                     f"L_les={outputs['loss_lesion'].item():.4f} "
-                    f"L_align={outputs['loss_align'].item():.4f}"
+                    f"L_align={outputs['loss_align'].item():.4f}",
+                    flush=True,
                 )
 
         return total_loss / max(num_batches, 1)
@@ -244,9 +350,19 @@ class Trainer:
         with torch.no_grad():
             for batch in self.odir_valid_loader:
                 batch = self._to_device(batch)
-                # For validation, use single forward pass through encoder
-                enc = self.model.encoder(batch["image_v1"])
-                preds = self.model.odir_head(enc["cls_token"])
+                # Match training feature path: cls_token + patch_pooled = 2048-dim
+                enc = self.model.encoder(batch["image_v1"], return_attention=True)
+                patch_pooled = enc["patch_tokens"].mean(dim=1)  # (B, 1024)
+                f_odir = torch.cat([enc["cls_token"], patch_pooled], dim=-1)  # (B, 2048)
+                # Match training CTAM path: zero input → learned bias for consistent distribution
+                if self.model.ctam_fusion is not None:
+                    zero_z = torch.zeros(
+                        f_odir.shape[0], self.cfg_model.ctam.proj_dim,
+                        device=f_odir.device, dtype=f_odir.dtype,
+                    )
+                    ctam_default = self.model.ctam_fusion_scale * self.model.ctam_fusion(zero_z)
+                    f_odir = f_odir + ctam_default
+                preds = self.model.odir_head(f_odir)
                 all_preds.append(preds.cpu())
                 all_targets.append(batch["labels"].cpu())
         all_preds = torch.cat(all_preds).numpy()

@@ -31,11 +31,11 @@ model:
   ddr_num_classes: 5
 
   lpm:
-    enabled: false                   # Disabled in stage1 for test
-    lambda_lesion: 0.1
+    enabled: true                    # Test LPM in stage2
+    lambda_lesion: 100.0
 
   ctam:
-    enabled: false
+    enabled: true                    # Test CTAM in stage2
     proj_dim: 64
     cross_attn_heads: 4
     residual_alpha: 0.5
@@ -51,6 +51,7 @@ loss:
     type: "dice_ce"
     dice_weight: 0.7
     ce_weight: 0.3
+    class_weights: [0.1, 5.0, 5.0, 10.0, 5.0]
 
 training:
   stage1:
@@ -64,8 +65,8 @@ training:
     epochs: 1
     lr: 0.0001
     freeze_ratio: 0.0
-    use_lpm: false                   # Keep off for quick test
-    use_ctam: false
+    use_lpm: true
+    use_ctam: true
     warmup_epochs: 0
 
   optimizer: "adamw"
@@ -82,6 +83,7 @@ training:
   dr_positive_weight: 3.0
 
   gradient_clip: 1.0
+  gradient_accumulation_steps: 2
   mixed_precision: "no"
   gradient_checkpointing: false
 

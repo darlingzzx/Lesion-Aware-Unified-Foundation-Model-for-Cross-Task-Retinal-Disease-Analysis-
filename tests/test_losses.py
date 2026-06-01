@@ -7,6 +7,7 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root / "src"))
 
 import torch
+import torch.nn.functional as F
 from retlesionuni.losses.asl_loss import AsymmetricLoss
 from retlesionuni.losses.dice_loss import DiceCELoss
 from retlesionuni.losses.contrastive_loss import SupervisedContrastiveLoss
@@ -80,7 +81,6 @@ def test_contrastive_loss_with_positives():
 
 
 if __name__ == "__main__":
-    import torch.nn.functional as F
     test_asl_loss_perfect()
     test_asl_loss_random()
     test_dice_ce_loss_perfect()
